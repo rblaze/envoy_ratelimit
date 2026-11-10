@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/coocood/freecache"
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	gostats "github.com/lyft/gostats"
 	logger "github.com/sirupsen/logrus"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/envoyproxy/ratelimit/src/memcached"
 	"github.com/envoyproxy/ratelimit/src/metrics"
 	"github.com/envoyproxy/ratelimit/src/redis"
+	"github.com/envoyproxy/ratelimit/src/rlspb"
 	"github.com/envoyproxy/ratelimit/src/server"
 	ratelimit "github.com/envoyproxy/ratelimit/src/service"
 	"github.com/envoyproxy/ratelimit/src/settings"
@@ -222,7 +222,7 @@ func (runner *Runner) Run() {
 	// Ratelimit is compatible with the below proto definition
 	// data-plane-api v3 rls.proto: https://github.com/envoyproxy/data-plane-api/blob/master/envoy/service/ratelimit/v3/rls.proto
 	// v2 proto is no longer supported
-	pb.RegisterRateLimitServiceServer(srv.GrpcServer(), service)
+	rlspb.RegisterRateLimitServiceServer(srv.GrpcServer(), service)
 
 	srv.Start(ctx)
 }

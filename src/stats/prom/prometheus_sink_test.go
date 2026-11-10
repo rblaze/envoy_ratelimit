@@ -234,3 +234,33 @@ func gatherMetric(g prometheus.Gatherer, name string) (*dto.MetricFamily, bool) 
 	}
 	return nil, false
 }
+
+func TestCheckAndConsumeCallErrorMappings(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	oldRegisterer, oldGatherer := prometheus.DefaultRegisterer, prometheus.DefaultGatherer
+	prometheus.DefaultRegisterer, prometheus.DefaultGatherer = reg, reg
+	defer func() {
+		prometheus.DefaultRegisterer, prometheus.DefaultGatherer = oldRegisterer, oldGatherer
+	}()
+
+	sink := NewPrometheusSink(WithAddr(":0"), WithPath("/metrics-check-consume"))
+	sink.FlushCounter("ratelimit_server.CheckRateLimit.total_requests", 2)
+	sink.FlushCounter("ratelimit_server.ConsumeRateLimit.total_requests", 3)
+	sink.FlushCounter("ratelimit.service.call.check_rate_limit.redis_error", 4)
+	sink.FlushCounter("ratelimit.service.call.consume_rate_limit.service_error", 5)
+
+	assert.Eventually(t, func() bool {
+		reqs, ok := gatherMetric(reg, "ratelimit_service_total_requests")
+		if !ok || len(reqs.Metric) != 2 {
+			return false
+		}
+		checkErr, ok := gatherMetric(reg, "ratelimit_service_check_rate_limit_error")
+		if !ok || len(checkErr.Metric) != 1 || toMap(checkErr.Metric[0].Label)["err_type"] != "redis_error" || *checkErr.Metric[0].Counter.Value != 4.0 {
+			return false
+		}
+		consumeErr, ok := gatherMetric(reg, "ratelimit_service_consume_rate_limit_error")
+		return ok && len(consumeErr.Metric) == 1 &&
+			toMap(consumeErr.Metric[0].Label)["err_type"] == "service_error" &&
+			*consumeErr.Metric[0].Counter.Value == 5.0
+	}, time.Second, time.Millisecond)
+}

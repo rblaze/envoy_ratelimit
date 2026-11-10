@@ -62,3 +62,21 @@ func TestSanitizeDescriptorMetricDotsAccessor(t *testing.T) {
 		"defaults to off for backward compatibility")
 	assert.True(t, stats.NewStatManager(statsStore, settings.Settings{SanitizeDescriptorMetricDots: true}).SanitizeDescriptorMetricDots())
 }
+
+func TestServiceStatsIncludesCheckAndConsumeScopes(t *testing.T) {
+	mockSink := gostatsMock.NewSink()
+	statsStore := gostats.NewStore(mockSink, false)
+	statsManager := stats.NewStatManager(statsStore, settings.Settings{})
+
+	svcStats := statsManager.NewServiceStats()
+	svcStats.CheckRateLimit.RedisError.Inc()
+	svcStats.CheckRateLimit.ServiceError.Inc()
+	svcStats.ConsumeRateLimit.RedisError.Inc()
+	svcStats.ConsumeRateLimit.ServiceError.Inc()
+	statsManager.GetStatsStore().Flush()
+
+	mockSink.AssertCounterExists(t, "ratelimit.service.call.check_rate_limit.redis_error")
+	mockSink.AssertCounterExists(t, "ratelimit.service.call.check_rate_limit.service_error")
+	mockSink.AssertCounterExists(t, "ratelimit.service.call.consume_rate_limit.redis_error")
+	mockSink.AssertCounterExists(t, "ratelimit.service.call.consume_rate_limit.service_error")
+}

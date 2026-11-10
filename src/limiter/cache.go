@@ -23,6 +23,18 @@ type RateLimitCache interface {
 		request *pb.RateLimitRequest,
 		limits []*config.RateLimit) []*pb.RateLimitResponse_DescriptorStatus
 
+	// Contact the cache to check whether rate limiting would take place without consuming quota.
+	CheckLimit(
+		ctx context.Context,
+		request *pb.RateLimitRequest,
+		limits []*config.RateLimit) []*pb.RateLimitResponse_DescriptorStatus
+
+	// Contact the cache to unconditionally consume rate limit quota without pre-check guards.
+	ConsumeLimit(
+		ctx context.Context,
+		request *pb.RateLimitRequest,
+		limits []*config.RateLimit) []*pb.RateLimitResponse_DescriptorStatus
+
 	// Waits for any unfinished asynchronous work. This may be used by unit tests,
 	// since the memcache cache does increments in a background gorountine.
 	Flush()

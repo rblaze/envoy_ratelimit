@@ -37,6 +37,34 @@ func (m *MockRateLimitCache) EXPECT() *MockRateLimitCacheMockRecorder {
 	return m.recorder
 }
 
+// CheckLimit mocks base method
+func (m *MockRateLimitCache) CheckLimit(arg0 context.Context, arg1 *envoy_service_ratelimit_v3.RateLimitRequest, arg2 []*config.RateLimit) []*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CheckLimit", arg0, arg1, arg2)
+	ret0, _ := ret[0].([]*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus)
+	return ret0
+}
+
+// CheckLimit indicates an expected call of CheckLimit
+func (mr *MockRateLimitCacheMockRecorder) CheckLimit(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckLimit", reflect.TypeOf((*MockRateLimitCache)(nil).CheckLimit), arg0, arg1, arg2)
+}
+
+// ConsumeLimit mocks base method
+func (m *MockRateLimitCache) ConsumeLimit(arg0 context.Context, arg1 *envoy_service_ratelimit_v3.RateLimitRequest, arg2 []*config.RateLimit) []*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ConsumeLimit", arg0, arg1, arg2)
+	ret0, _ := ret[0].([]*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus)
+	return ret0
+}
+
+// ConsumeLimit indicates an expected call of ConsumeLimit
+func (mr *MockRateLimitCacheMockRecorder) ConsumeLimit(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConsumeLimit", reflect.TypeOf((*MockRateLimitCache)(nil).ConsumeLimit), arg0, arg1, arg2)
+}
+
 // DoLimit mocks base method
 func (m *MockRateLimitCache) DoLimit(arg0 context.Context, arg1 *envoy_service_ratelimit_v3.RateLimitRequest, arg2 []*config.RateLimit) []*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus {
 	m.ctrl.T.Helper()

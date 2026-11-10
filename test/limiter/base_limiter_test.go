@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"math"
 	"math/rand"
 	"strconv"
 	"testing"
@@ -391,4 +392,96 @@ func TestGetResponseStatusBelowLimitShadowMode(t *testing.T) {
 	assert.Equal(uint64(1), limits[0].Stats.WithinLimit.Value())
 	// No shadow_mode so, no stats change
 	assert.Equal(uint64(0), limits[0].Stats.ShadowMode.Value())
+}
+
+func TestGenerateCacheKeysWithoutStats(t *testing.T) {
+	assert := assert.New(t)
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+	timeSource := mock_utils.NewMockTimeSource(controller)
+	jitterSource := mock_utils.NewMockJitterRandSource(controller)
+	statsStore := stats.NewStore(stats.NewNullSink(), false)
+	sm := mockstats.NewMockStatManager(statsStore)
+	timeSource.EXPECT().UnixNow().Return(int64(1234))
+	baseRateLimit := limiter.NewBaseRateLimit(timeSource, rand.New(jitterSource), 3600, nil, 0.8, "", sm, false, time.Thursday)
+
+	request := common.NewRateLimitRequest("domain", [][][2]string{{{"key", "value"}}}, 5)
+	limits := []*config.RateLimit{config.NewRateLimit(10, pb.RateLimitResponse_RateLimit_SECOND, sm.NewStats("key_value"), false, false, false, "", nil, false)}
+
+	cacheKeys := baseRateLimit.GenerateCacheKeysWithoutStats(request, limits)
+	assert.Equal(1, len(cacheKeys))
+	assert.Equal("domain_key_value_1234", cacheKeys[0].Key)
+	assert.Equal(uint64(0), limits[0].Stats.TotalHits.Value())
+	assert.Equal(uint64(0), limits[0].Stats.TotalNegativeHits.Value())
+}
+
+func TestGetCheckResponseDescriptorStatus(t *testing.T) {
+	assert := assert.New(t)
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+	timeSource := mock_utils.NewMockTimeSource(controller)
+	timeSource.EXPECT().UnixNow().Return(int64(1234)).AnyTimes()
+	statsStore := stats.NewStore(stats.NewNullSink(), false)
+	localCache := freecache.NewCache(100)
+	sm := mockstats.NewMockStatManager(statsStore)
+	baseRateLimit := limiter.NewBaseRateLimit(timeSource, nil, 3600, localCache, 0.8, "", sm, false, time.Thursday)
+
+	// 1. Empty key returns OK with nil CurrentLimit.
+	emptyStatus := baseRateLimit.GetCheckResponseDescriptorStatus("", nil, false, 0, utils.HitsAddend{Value: 1})
+	assert.Equal(pb.RateLimitResponse_OK, emptyStatus.GetCode())
+	assert.Nil(emptyStatus.GetCurrentLimit())
+	assert.Equal(uint32(0), emptyStatus.GetLimitRemaining())
+
+	// 2. Within limit: limit=500, current=400, checking hitsAddend=50 -> OK, LimitRemaining=100 (actual remaining).
+	limit := config.NewRateLimit(500, pb.RateLimitResponse_RateLimit_MINUTE, sm.NewStats("tokens"), false, false, false, "", nil, false)
+	status := baseRateLimit.GetCheckResponseDescriptorStatus("tokens_key", limit, false, 400, utils.HitsAddend{Value: 50})
+	assert.Equal(pb.RateLimitResponse_OK, status.GetCode())
+	assert.Equal(uint32(100), status.GetLimitRemaining())
+	assert.Equal(limit.Limit, status.GetCurrentLimit())
+
+	// 3. Over limit due to checked addend: limit=500, current=400, checking hitsAddend=250 -> OVER_LIMIT, LimitRemaining=100, localCache NOT poisoned.
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("tokens_key", limit, false, 400, utils.HitsAddend{Value: 250})
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, status.GetCode())
+	assert.Equal(uint32(100), status.GetLimitRemaining())
+	_, err := localCache.Get([]byte("tokens_key"))
+	assert.Error(err, "CheckRateLimit must not write to localCache")
+
+	// 4. Overflow safety with math.MaxUint64 hitsAddend.
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("tokens_key", limit, false, 400, utils.HitsAddend{Value: math.MaxUint64})
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, status.GetCode())
+	assert.Equal(uint32(100), status.GetLimitRemaining())
+
+	// 5. Already at/above limit: current=505, hitsAddend=0 -> OVER_LIMIT, LimitRemaining=0.
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("tokens_key", limit, false, 505, utils.HitsAddend{Value: 0})
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, status.GetCode())
+	assert.Equal(uint32(0), status.GetLimitRemaining())
+
+	// 6. Local cache hit: OVER_LIMIT with LimitRemaining=0.
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("tokens_key", limit, true, 0, utils.HitsAddend{Value: 1})
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, status.GetCode())
+	assert.Equal(uint32(0), status.GetLimitRemaining())
+
+	// 7. Negative hits on check: always OK with actual LimitRemaining.
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("tokens_key", limit, false, 400, utils.HitsAddend{Value: 50, IsNegative: true})
+	assert.Equal(pb.RateLimitResponse_OK, status.GetCode())
+	assert.Equal(uint32(100), status.GetLimitRemaining())
+
+	// Verify zero per-rule stats mutated across all checks above.
+	assert.Equal(uint64(0), limit.Stats.TotalHits.Value())
+	assert.Equal(uint64(0), limit.Stats.WithinLimit.Value())
+	assert.Equal(uint64(0), limit.Stats.NearLimit.Value())
+	assert.Equal(uint64(0), limit.Stats.OverLimit.Value())
+	assert.Equal(uint64(0), limit.Stats.OverLimitWithLocalCache.Value())
+	assert.Equal(uint64(0), limit.Stats.ShadowMode.Value())
+	assert.Equal(uint64(0), limit.Stats.TotalNegativeHits.Value())
+
+	// 8. Rule shadow mode on check: returns OK without incrementing ShadowMode stat.
+	shadowLimit := config.NewRateLimit(500, pb.RateLimitResponse_RateLimit_MINUTE, sm.NewStats("shadow_tokens"), false, true, false, "", nil, false)
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("shadow_key", shadowLimit, false, 400, utils.HitsAddend{Value: 250})
+	assert.Equal(pb.RateLimitResponse_OK, status.GetCode())
+	assert.Equal(uint32(100), status.GetLimitRemaining())
+	status = baseRateLimit.GetCheckResponseDescriptorStatus("shadow_key", shadowLimit, true, 0, utils.HitsAddend{Value: 1})
+	assert.Equal(pb.RateLimitResponse_OK, status.GetCode())
+	assert.Equal(uint32(0), status.GetLimitRemaining())
+	assert.Equal(uint64(0), shadowLimit.Stats.ShadowMode.Value())
 }

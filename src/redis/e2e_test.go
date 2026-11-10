@@ -1,6 +1,7 @@
 package redis_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	pb_struct "github.com/envoyproxy/go-control-plane/envoy/extensions/common/ratelimit/v3"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	gostats "github.com/lyft/gostats"
@@ -18,8 +20,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/envoyproxy/ratelimit/src/redis"
+	"github.com/envoyproxy/ratelimit/src/rlspb"
 	"github.com/envoyproxy/ratelimit/src/service_cmd/runner"
 	"github.com/envoyproxy/ratelimit/src/settings"
 )
@@ -323,4 +327,146 @@ func TestServiceHealthProbeDisabledByDefault(t *testing.T) {
 	time.Sleep(time.Second)
 	assert.Equal(t, http.StatusOK, svc.ready())
 	assert.Equal(t, http.StatusOK, svc.health())
+}
+
+func TestCheckAndConsumeRateLimitEndToEnd(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	const modelRouterCfg = `domain: model_router
+descriptors:
+  - key: model
+    value: gpt-4o
+    descriptors:
+      - key: quota_type
+        value: requests
+        rate_limit:
+          unit: hour
+          requests_per_unit: 10
+      - key: quota_type
+        value: tokens
+        rate_limit:
+          unit: hour
+          requests_per_unit: 500
+`
+	root := t.TempDir()
+	configDir := filepath.Join(root, "ratelimit", "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "model_router.yaml"), []byte(modelRouterCfg), 0o644))
+
+	s := settings.NewSettings()
+	s.Host = "127.0.0.1"
+	s.GrpcHost = "127.0.0.1"
+	s.DebugHost = "127.0.0.1"
+	s.Port = freePort(t)
+	s.GrpcPort = freePort(t)
+	s.DebugPort = freePort(t)
+	s.DisableStats = true
+	s.UseStatsd = false
+	s.LogLevel = "error"
+	s.RuntimePath = root
+	s.RuntimeSubdirectory = "ratelimit"
+	s.RuntimeAppDirectory = "config"
+	s.RuntimeWatchRoot = false
+	s.BackendType = "redis"
+	s.RedisSocketType = "tcp"
+	s.RedisUrl = mr.Addr()
+	s.LocalCacheSizeInBytes = 1024 * 64
+	s.StopCacheKeyIncrementWhenOverlimit = true
+
+	r := runner.NewRunner(s)
+	go r.Run()
+	t.Cleanup(r.Stop)
+
+	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", s.GrpcPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	client := rlspb.NewRateLimitServiceClient(conn)
+	makeReq := func(reqAddend, tokAddend uint64) *pb.RateLimitRequest {
+		return &pb.RateLimitRequest{
+			Domain: "model_router",
+			Descriptors: []*pb_struct.RateLimitDescriptor{
+				{
+					Entries: []*pb_struct.RateLimitDescriptor_Entry{
+						{Key: "model", Value: "gpt-4o"},
+						{Key: "quota_type", Value: "requests"},
+					},
+					HitsAddend: &wrapperspb.UInt64Value{Value: reqAddend},
+				},
+				{
+					Entries: []*pb_struct.RateLimitDescriptor_Entry{
+						{Key: "model", Value: "gpt-4o"},
+						{Key: "quota_type", Value: "tokens"},
+					},
+					HitsAddend: &wrapperspb.UInt64Value{Value: tokAddend},
+				},
+			},
+		}
+	}
+
+	require.Eventually(t, func() bool {
+		_, err := client.CheckRateLimit(context.Background(), makeReq(1, 100))
+		return err == nil
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// 1. Cold bucket CheckRateLimit: OK with full remaining quota (10 requests, 500 tokens) and no Redis keys created.
+	resp, err := client.CheckRateLimit(context.Background(), makeReq(1, 250))
+	require.NoError(t, err)
+	assert.Equal(t, pb.RateLimitResponse_OK, resp.OverallCode)
+	assert.Equal(t, uint32(10), resp.Statuses[0].LimitRemaining)
+	assert.Equal(t, uint32(500), resp.Statuses[1].LimitRemaining)
+	assert.Empty(t, mr.Keys(), "CheckRateLimit must not write keys to Redis")
+
+	// 2. ConsumeRateLimit for 1 request + 400 tokens -> OK, remaining 9 requests & 100 tokens.
+	resp, err = client.ConsumeRateLimit(context.Background(), makeReq(1, 400))
+	require.NoError(t, err)
+	assert.Equal(t, pb.RateLimitResponse_OK, resp.OverallCode)
+	assert.Equal(t, uint32(9), resp.Statuses[0].LimitRemaining)
+	assert.Equal(t, uint32(100), resp.Statuses[1].LimitRemaining)
+
+	// 3. CheckRateLimit for 250 tokens -> OVER_LIMIT with actual LimitRemaining=100, and must NOT poison localCache.
+	resp, err = client.CheckRateLimit(context.Background(), makeReq(1, 250))
+	require.NoError(t, err)
+	assert.Equal(t, pb.RateLimitResponse_OVER_LIMIT, resp.OverallCode)
+	assert.Equal(t, pb.RateLimitResponse_OK, resp.Statuses[0].Code)
+	assert.Equal(t, uint32(9), resp.Statuses[0].LimitRemaining)
+	assert.Equal(t, pb.RateLimitResponse_OVER_LIMIT, resp.Statuses[1].Code)
+	assert.Equal(t, uint32(100), resp.Statuses[1].LimitRemaining)
+
+	// 4. Subsequent CheckRateLimit for 80 tokens -> still OK (proving localCache was not poisoned).
+	resp, err = client.CheckRateLimit(context.Background(), makeReq(1, 80))
+	require.NoError(t, err)
+	assert.Equal(t, pb.RateLimitResponse_OK, resp.OverallCode)
+	assert.Equal(t, uint32(100), resp.Statuses[1].LimitRemaining)
+
+	// 5. ConsumeRateLimit for 1 request + 200 tokens -> pushes tokens to 600 (> 500), AND still increments requests to 2
+	// despite StopCacheKeyIncrementWhenOverlimit=true.
+	resp, err = client.ConsumeRateLimit(context.Background(), makeReq(1, 200))
+	require.NoError(t, err)
+	assert.Equal(t, pb.RateLimitResponse_OVER_LIMIT, resp.OverallCode)
+	assert.Equal(t, pb.RateLimitResponse_OK, resp.Statuses[0].Code)
+	assert.Equal(t, uint32(8), resp.Statuses[0].LimitRemaining)
+	assert.Equal(t, pb.RateLimitResponse_OVER_LIMIT, resp.Statuses[1].Code)
+	assert.Equal(t, uint32(0), resp.Statuses[1].LimitRemaining)
+
+	// 6. Verify HTTP /json/check and /json/consume endpoints.
+	httpBase := fmt.Sprintf("http://127.0.0.1:%d", s.Port)
+	checkBody := `{"domain":"model_router","descriptors":[{"entries":[{"key":"model","value":"gpt-4o"},{"key":"quota_type","value":"tokens"}],"hitsAddend":"1"}]}`
+	httpResp, err := http.Post(httpBase+"/json/check", "application/json", bytes.NewBufferString(checkBody))
+	require.NoError(t, err)
+	httpResp.Body.Close()
+	assert.Equal(t, http.StatusTooManyRequests, httpResp.StatusCode)
+
+	consumeReqBody := `{"domain":"model_router","descriptors":[{"entries":[{"key":"model","value":"gpt-4o"},{"key":"quota_type","value":"requests"}],"hitsAddend":"1"}]}`
+	httpResp, err = http.Post(httpBase+"/json/consume", "application/json", bytes.NewBufferString(consumeReqBody))
+	require.NoError(t, err)
+	httpResp.Body.Close()
+	assert.Equal(t, http.StatusOK, httpResp.StatusCode)
+
+	// Verify server gRPC metrics and rule stats.
+	store := r.GetStatsStore()
+	assert.Positive(t, store.NewCounter("ratelimit_server.CheckRateLimit.total_requests").Value())
+	assert.Positive(t, store.NewCounter("ratelimit_server.ConsumeRateLimit.total_requests").Value())
+	// TotalHits on requests rule: 1 + 1 + 1 = 3 (none from CheckRateLimit).
+	assert.EqualValues(t, 3, store.NewCounter("ratelimit.service.rate_limit.model_router.model_gpt-4o.quota_type_requests.total_hits").Value())
 }

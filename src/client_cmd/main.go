@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/envoyproxy/ratelimit/src/rlspb"
 	"github.com/envoyproxy/ratelimit/src/utils"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -65,6 +66,8 @@ func main() {
 	dialString := flag.String(
 		"dial_string", "localhost:8081", "url of ratelimit server in <host>:<port> form")
 	domain := flag.String("domain", "", "rate limit configuration domain to query")
+	method := flag.String("method", "ShouldRateLimit", "RPC method to invoke: ShouldRateLimit (or should), CheckRateLimit (or check), ConsumeRateLimit (or consume)")
+	hitsAddend := flag.Uint("hits_addend", 1, "hits_addend value to send in the RateLimitRequest")
 	descriptorsValue := descriptorsValue{[]*pb_struct.RateLimitDescriptor{}}
 	flag.Var(
 		&descriptorsValue, "descriptors",
@@ -104,17 +107,28 @@ func main() {
 	}
 
 	defer conn.Close()
-	c := pb.NewRateLimitServiceClient(conn)
+	c := rlspb.NewRateLimitServiceClient(conn)
 	desc := make([]*pb_struct.RateLimitDescriptor, len(descriptorsValue.descriptors))
 	copy(desc, descriptorsValue.descriptors)
 
-	response, err := c.ShouldRateLimit(
-		context.Background(),
-		&pb.RateLimitRequest{
-			Domain:      *domain,
-			Descriptors: desc,
-			HitsAddend:  1,
-		})
+	req := &pb.RateLimitRequest{
+		Domain:      *domain,
+		Descriptors: desc,
+		HitsAddend:  uint32(*hitsAddend),
+	}
+
+	var response *pb.RateLimitResponse
+	switch strings.ToLower(*method) {
+	case "shouldratelimit", "should":
+		response, err = c.ShouldRateLimit(context.Background(), req)
+	case "checkratelimit", "check":
+		response, err = c.CheckRateLimit(context.Background(), req)
+	case "consumeratelimit", "consume":
+		response, err = c.ConsumeRateLimit(context.Background(), req)
+	default:
+		fmt.Printf("invalid method %q: must be ShouldRateLimit, CheckRateLimit, or ConsumeRateLimit\n", *method)
+		os.Exit(1)
+	}
 	if err != nil {
 		fmt.Printf("request error: %s\n", err.Error())
 		os.Exit(1)

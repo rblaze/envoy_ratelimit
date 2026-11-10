@@ -15,6 +15,12 @@ type Manager interface {
 	// Initializes a ShouldRateLimitStats structure.
 	// Multiple calls to this method are idempotent.
 	NewShouldRateLimitStats() ShouldRateLimitStats
+	// Initializes a ShouldRateLimitStats structure for CheckRateLimit calls.
+	// Multiple calls to this method are idempotent.
+	NewCheckRateLimitStats() ShouldRateLimitStats
+	// Initializes a ShouldRateLimitStats structure for ConsumeRateLimit calls.
+	// Multiple calls to this method are idempotent.
+	NewConsumeRateLimitStats() ShouldRateLimitStats
 	// Initializes a ServiceStats structure.
 	// Multiple calls to this method are idempotent.
 	NewServiceStats() ServiceStats
@@ -30,6 +36,8 @@ type ManagerImpl struct {
 	rlStatsScope                 gostats.Scope
 	serviceStatsScope            gostats.Scope
 	shouldRateLimitScope         gostats.Scope
+	checkRateLimitScope          gostats.Scope
+	consumeRateLimitScope        gostats.Scope
 	sanitizeDescriptorMetricDots bool
 }
 
@@ -48,6 +56,8 @@ type ServiceStats struct {
 	ConfigLoadSuccess gostats.Counter
 	ConfigLoadError   gostats.Counter
 	ShouldRateLimit   ShouldRateLimitStats
+	CheckRateLimit    ShouldRateLimitStats
+	ConsumeRateLimit  ShouldRateLimitStats
 	GlobalShadowMode  gostats.Counter
 }
 

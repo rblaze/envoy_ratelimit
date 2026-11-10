@@ -941,3 +941,123 @@ func TestOverLimitWithStopCacheKeyIncrementWhenOverlimitConfig(t *testing.T) {
 	// Check the local cache stats.
 	t.Run("TestLocalCacheStats_2", testLocalCacheStats(localCacheScopeName, localCacheStats, statsStore, sink, 0, 6, 6, 0, 1))
 }
+
+func TestRedisCheckLimit(t *testing.T) {
+	assert := assert.New(t)
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+
+	statsStore := gostats.NewStore(gostats.NewNullSink(), false)
+	sm := stats.NewMockStatManager(statsStore)
+	client := mock_redis.NewMockClient(controller)
+	perSecondClient := mock_redis.NewMockClient(controller)
+	timeSource := mock_utils.NewMockTimeSource(controller)
+	localCache := freecache.NewCache(100)
+	cache := redis.NewFixedRateLimitCacheImpl(client, perSecondClient, timeSource, rand.New(rand.NewSource(1)), 0, localCache, 0.8, "", sm, true, false, time.Thursday)
+
+	// 1. CheckLimit issues GET only (no INCRBY / EXPIRE), routes per-second keys to perSecondClient,
+	// reports actual LimitRemaining, and neither mutates rule stats nor populates localCache.
+	timeSource.EXPECT().UnixNow().Return(int64(1234)).AnyTimes()
+	perSecondClient.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "GET", "domain_req_1_1234").SetArg(1, uint64(3)).DoAndReturn(pipeAppend)
+	perSecondClient.EXPECT().PipeDo(gomock.Any(), gomock.Any()).Return(nil)
+	client.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "GET", "domain_tok_v_1200").SetArg(1, uint64(400)).DoAndReturn(pipeAppend)
+	client.EXPECT().PipeDo(gomock.Any(), gomock.Any()).Return(nil)
+
+	request := common.NewRateLimitRequestWithPerDescriptorHitsAddend(
+		"domain",
+		[][][2]string{{{"req", "1"}}, {{"tok", "v"}}},
+		[]uint64{1, 250},
+	)
+	limits := []*config.RateLimit{
+		config.NewRateLimit(10, pb.RateLimitResponse_RateLimit_SECOND, sm.NewStats("req_1"), false, false, false, "", nil, false),
+		config.NewRateLimit(500, pb.RateLimitResponse_RateLimit_MINUTE, sm.NewStats("tok_v"), false, false, false, "", nil, false),
+	}
+
+	statuses := cache.CheckLimit(context.Background(), request, limits)
+	assert.Equal(pb.RateLimitResponse_OK, statuses[0].Code)
+	assert.Equal(uint32(7), statuses[0].LimitRemaining)
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, statuses[1].Code)
+	assert.Equal(uint32(100), statuses[1].LimitRemaining)
+
+	// Verify localCache was not populated by CheckLimit and rule stats are untouched.
+	_, err := localCache.Get([]byte("domain_tok_v_1200"))
+	assert.Error(err)
+	assert.Equal(uint64(0), limits[0].Stats.TotalHits.Value())
+	assert.Equal(uint64(0), limits[0].Stats.WithinLimit.Value())
+	assert.Equal(uint64(0), limits[1].Stats.TotalHits.Value())
+	assert.Equal(uint64(0), limits[1].Stats.OverLimit.Value())
+
+	// 2. When a key IS already in localCache, CheckLimit short-circuits Redis GET and returns OVER_LIMIT with LimitRemaining=0.
+	assert.NoError(localCache.Set([]byte("domain_tok_v_1200"), []byte{}, 60))
+	perSecondClient.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "GET", "domain_req_1_1234").SetArg(1, uint64(3)).DoAndReturn(pipeAppend)
+	perSecondClient.EXPECT().PipeDo(gomock.Any(), gomock.Any()).Return(nil)
+
+	statuses = cache.CheckLimit(context.Background(), request, limits)
+	assert.Equal(pb.RateLimitResponse_OK, statuses[0].Code)
+	assert.Equal(uint32(7), statuses[0].LimitRemaining)
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, statuses[1].Code)
+	assert.Equal(uint32(0), statuses[1].LimitRemaining)
+	assert.Equal(uint64(0), limits[1].Stats.OverLimitWithLocalCache.Value())
+}
+
+func TestRedisConsumeLimit(t *testing.T) {
+	assert := assert.New(t)
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+
+	statsStore := gostats.NewStore(gostats.NewNullSink(), false)
+	sm := stats.NewMockStatManager(statsStore)
+	client := mock_redis.NewMockClient(controller)
+	timeSource := mock_utils.NewMockTimeSource(controller)
+	localCache := freecache.NewCache(100)
+	// Enable stopCacheKeyIncrementWhenOverlimit=true and localCache to verify ConsumeLimit bypasses both pre-checks.
+	cache := redis.NewFixedRateLimitCacheImpl(client, nil, timeSource, rand.New(rand.NewSource(1)), 0, localCache, 0.8, "", sm, true, false, time.Thursday)
+
+	timeSource.EXPECT().UnixNow().Return(int64(1234)).AnyTimes()
+
+	// Pre-populate key1 in localCache to prove ConsumeLimit still increments it unconditionally,
+	// and does NOT issue any GET pre-check despite stopCacheKeyIncrementWhenOverlimit=true.
+	assert.NoError(localCache.Set([]byte("domain_key1_v_1200"), []byte{}, 60))
+
+	client.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "INCRBY", "domain_key1_v_1200", uint64(5)).SetArg(1, uint64(15)).DoAndReturn(pipeAppend)
+	client.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "EXPIRE", "domain_key1_v_1200", int64(60)).DoAndReturn(pipeAppend)
+	client.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "INCRBY", "domain_key2_v_1200", uint64(200)).SetArg(1, uint64(600)).DoAndReturn(pipeAppend)
+	client.EXPECT().PipeAppend(gomock.Any(), gomock.Any(), "EXPIRE", "domain_key2_v_1200", int64(60)).DoAndReturn(pipeAppend)
+	client.EXPECT().PipeDo(gomock.Any(), gomock.Any()).Return(nil)
+
+	request := common.NewRateLimitRequestWithPerDescriptorHitsAddend(
+		"domain",
+		[][][2]string{{{"key1", "v"}}, {{"key2", "v"}}},
+		[]uint64{5, 200},
+	)
+	limits := []*config.RateLimit{
+		config.NewRateLimit(10, pb.RateLimitResponse_RateLimit_MINUTE, sm.NewStats("key1_v"), false, false, false, "", nil, false),
+		config.NewRateLimit(500, pb.RateLimitResponse_RateLimit_MINUTE, sm.NewStats("key2_v"), false, false, false, "", nil, false),
+	}
+
+	statuses := cache.ConsumeLimit(context.Background(), request, limits)
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, statuses[0].Code)
+	assert.Equal(uint32(0), statuses[0].LimitRemaining)
+	assert.Equal(pb.RateLimitResponse_OVER_LIMIT, statuses[1].Code)
+	assert.Equal(uint32(0), statuses[1].LimitRemaining)
+
+	// key2 crossed its limit of 500 -> ConsumeLimit should populate localCache for key2.
+	_, err := localCache.Get([]byte("domain_key2_v_1200"))
+	assert.NoError(err)
+
+	// Verify per-rule stats updated.
+	assert.Equal(uint64(5), limits[0].Stats.TotalHits.Value())
+	assert.Equal(uint64(5), limits[0].Stats.OverLimit.Value())
+	assert.Equal(uint64(200), limits[1].Stats.TotalHits.Value())
+	assert.Equal(uint64(100), limits[1].Stats.OverLimit.Value())
+
+	// Also verify negative hits in ConsumeLimit.
+	client.EXPECT().PipeAppendWithRoutingKey(gomock.Any(), "domain_key1_v_1200", gomock.Any(), "EVAL", limiter.DecrementScript, 1, "domain_key1_v_1200", uint64(8), int64(60)).SetArg(2, uint64(7)).DoAndReturn(pipeAppendWithRoutingKey)
+	client.EXPECT().PipeDo(gomock.Any(), gomock.Any()).Return(nil)
+
+	negReq := common.NewRateLimitRequestWithNegativeHits("domain", [][][2]string{{{"key1", "v"}}}, []uint64{8}, []bool{true})
+	negStatuses := cache.ConsumeLimit(context.Background(), negReq, []*config.RateLimit{limits[0]})
+	assert.Equal(pb.RateLimitResponse_OK, negStatuses[0].Code)
+	assert.Equal(uint32(3), negStatuses[0].LimitRemaining)
+	assert.Equal(uint64(8), limits[0].Stats.TotalNegativeHits.Value())
+}

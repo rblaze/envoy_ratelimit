@@ -29,13 +29,14 @@ import (
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/provider"
 	"github.com/envoyproxy/ratelimit/src/redis"
+	"github.com/envoyproxy/ratelimit/src/rlspb"
 	"github.com/envoyproxy/ratelimit/src/server"
 )
 
 var tracer = otel.Tracer("ratelimit")
 
 type RateLimitServiceServer interface {
-	pb.RateLimitServiceServer
+	rlspb.RateLimitServiceServer
 	GetCurrentConfig() (config.RateLimitConfig, bool, bool)
 	SetConfig(updateEvent provider.ConfigUpdateEvent, healthyWithAtLeastOneConfigLoad bool)
 }
@@ -208,8 +209,13 @@ const (
 	modelNameOverrideDescriptorKey = "model_name_override"
 )
 
-func (this *service) shouldRateLimitWorker(
-	ctx context.Context, request *pb.RateLimitRequest,
+type rateLimitCacheOp func(ctx context.Context, request *pb.RateLimitRequest, limits []*config.RateLimit) []*pb.RateLimitResponse_DescriptorStatus
+
+func (this *service) rateLimitWorker(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+	cacheOp rateLimitCacheOp,
+	recordGlobalShadowStat bool,
 ) *pb.RateLimitResponse {
 	checkServiceErr(request.Domain != "", "rate limit domain must not be empty")
 	checkServiceErr(len(request.Descriptors) != 0, "rate limit descriptor list must not be empty")
@@ -220,7 +226,7 @@ func (this *service) shouldRateLimitWorker(
 	assert.Assert(len(limitsToCheck) == len(isUnlimited))
 	assert.Assert(len(limitsToCheck) == len(request.Descriptors))
 
-	responseDescriptorStatuses := this.cache.DoLimit(ctx, request, limitsToCheck)
+	responseDescriptorStatuses := cacheOp(ctx, request, limitsToCheck)
 	logger.Debugf("descriptor statuses: %+v", responseDescriptorStatuses)
 	assert.Assert(len(limitsToCheck) == len(responseDescriptorStatuses))
 
@@ -289,8 +295,10 @@ func (this *service) shouldRateLimitWorker(
 				group.over = true
 			}
 		} else if over {
+			if failedRateLimitDescriptors == 0 || descriptorStatus.LimitRemaining <= minimumDescriptor.LimitRemaining {
+				minimumDescriptor = descriptorStatus
+			}
 			failedRateLimitDescriptors += 1
-			minimumDescriptor = descriptorStatus
 			minLimitRemaining = 0
 		}
 	}
@@ -336,7 +344,9 @@ func (this *service) shouldRateLimitWorker(
 	// If there is a global shadow_mode, it should always return OK
 	if finalCode == pb.RateLimitResponse_OVER_LIMIT && globalShadowMode {
 		finalCode = pb.RateLimitResponse_OK
-		this.stats.GlobalShadowMode.Inc()
+		if recordGlobalShadowStat {
+			this.stats.GlobalShadowMode.Inc()
+		}
 	}
 
 	// If response dynamic data enabled, set dynamic data on response.
@@ -621,14 +631,18 @@ func (this *service) rateLimitRequestResetHeader(descriptor *pb.RateLimitRespons
 	}
 }
 
-func (this *service) ShouldRateLimit(
+func (this *service) executeRateLimitCall(
 	ctx context.Context,
 	request *pb.RateLimitRequest,
+	methodName string,
+	callStats *stats.ShouldRateLimitStats,
+	cacheOp rateLimitCacheOp,
+	recordGlobalShadowStat bool,
 ) (finalResponse *pb.RateLimitResponse, finalError error) {
-	logger.Debugf("ShouldRateLimit: %+v", request)
+	logger.Debugf("%s: %+v", methodName, request)
 	// Generate trace
 	_, span := tracer.Start(
-		ctx, "ShouldRateLimit Execution",
+		ctx, methodName+" Execution",
 		trace.WithAttributes(
 			attribute.String("domain", request.Domain),
 			attribute.String("request string", request.String()),
@@ -636,8 +650,8 @@ func (this *service) ShouldRateLimit(
 	)
 	defer span.End()
 
-	this.stats.ShouldRateLimit.Inflight.Inc()
-	defer this.stats.ShouldRateLimit.Inflight.Dec()
+	callStats.Inflight.Inc()
+	defer callStats.Inflight.Dec()
 
 	defer func() {
 		err := recover()
@@ -651,7 +665,7 @@ func (this *service) ShouldRateLimit(
 		switch t := err.(type) {
 		case redis.RedisError:
 			{
-				this.stats.ShouldRateLimit.RedisError.Inc()
+				callStats.RedisError.Inc()
 				if ok, suppressed := this.redisErrorLogLimiter.Allow(); ok {
 					logger.Warnf("rate limit call failed with a Redis error: %v (%d similar errors suppressed)", t, suppressed)
 				}
@@ -659,7 +673,7 @@ func (this *service) ShouldRateLimit(
 			}
 		case serviceError:
 			{
-				this.stats.ShouldRateLimit.ServiceError.Inc()
+				callStats.ServiceError.Inc()
 				finalError = t
 			}
 		default:
@@ -667,10 +681,31 @@ func (this *service) ShouldRateLimit(
 		}
 	}()
 
-	response := this.shouldRateLimitWorker(ctx, request)
+	response := this.rateLimitWorker(ctx, request, cacheOp, recordGlobalShadowStat)
 	logger.Debugf("returning normal response: %+v", response)
 
 	return response, nil
+}
+
+func (this *service) ShouldRateLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+) (*pb.RateLimitResponse, error) {
+	return this.executeRateLimitCall(ctx, request, "ShouldRateLimit", &this.stats.ShouldRateLimit, this.cache.DoLimit, true)
+}
+
+func (this *service) CheckRateLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+) (*pb.RateLimitResponse, error) {
+	return this.executeRateLimitCall(ctx, request, "CheckRateLimit", &this.stats.CheckRateLimit, this.cache.CheckLimit, false)
+}
+
+func (this *service) ConsumeRateLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+) (*pb.RateLimitResponse, error) {
+	return this.executeRateLimitCall(ctx, request, "ConsumeRateLimit", &this.stats.ConsumeRateLimit, this.cache.ConsumeLimit, true)
 }
 
 func (this *service) GetCurrentConfig() (config.RateLimitConfig, bool, bool) {

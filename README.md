@@ -974,6 +974,12 @@ By default the ratelimit gRPC server binds to `0.0.0.0:8081`. To change this set
 socket then set `GRPC_UDS`, e.g. `GRPC_UDS=/<dir>/ratelimit.sock` and leave
 `GRPC_HOST` and `GRPC_PORT` unmodified.
 
+`envoy.service.ratelimit.v3.RateLimitService` exposes three unary RPCs:
+
+- `ShouldRateLimit`: checks descriptors against configured limits and consumes `hits_addend` quota.
+- `CheckRateLimit`: performs a read-only check (`current + hits_addend > limit`) without mutating backend counters, local over-limit cache, or per-rule statistics, and reports actual unconsumed `limit_remaining` (`max(0, limit - current)`).
+- `ConsumeRateLimit`: unconditionally consumes `hits_addend` (or refunds capacity when `is_negative_hits` is `true`), bypassing local over-limit cache short-circuiting and `STOP_CACHE_KEY_INCREMENT_WHEN_OVERLIMIT` pre-checks, while reporting the post-consumption `RateLimitResponse`.
+
 # Request Fields
 
 For information on the fields of a Ratelimit gRPC request please read the information
@@ -1002,6 +1008,8 @@ The [gRPC client](https://github.com/envoyproxy/ratelimit/blob/master/src/client
 
 - `-dial_string`: used to specify the address of ratelimit server. It defaults to `localhost:8081`.
 - `-domain`: used to specify the domain.
+- `-method`: RPC method to invoke: `ShouldRateLimit` (`should`), `CheckRateLimit` (`check`), or `ConsumeRateLimit` (`consume`). Defaults to `ShouldRateLimit`.
+- `-hits_addend`: `hits_addend` value to send in the `RateLimitRequest`. Defaults to `1`.
 - `-descriptors`: used to specify one descriptor. You can pass multiple descriptors like following:
 
 ```
@@ -1085,12 +1093,18 @@ ratelimit.service.rate_limit.messaging.auth-service.over_limit.shadow_mode: 1
 
 ## Service statistics
 
-Besides the per-rule statistics, the service reports:
+Besides the per-rule statistics, the service reports per-RPC error and inflight metrics:
 
 ```
-ratelimit.service.call.should_rate_limit.redis_error     # calls that failed with a Redis error
-ratelimit.service.call.should_rate_limit.service_error   # calls that failed with any other error
-ratelimit.service.call.should_rate_limit.inflight        # calls received and not answered yet (gauge)
+ratelimit.service.call.should_rate_limit.redis_error      # ShouldRateLimit calls that failed with a Redis error
+ratelimit.service.call.should_rate_limit.service_error    # ShouldRateLimit calls that failed with any other error
+ratelimit.service.call.should_rate_limit.inflight         # ShouldRateLimit calls received and not answered yet (gauge)
+ratelimit.service.call.check_rate_limit.redis_error       # CheckRateLimit calls that failed with a Redis error
+ratelimit.service.call.check_rate_limit.service_error     # CheckRateLimit calls that failed with any other error
+ratelimit.service.call.check_rate_limit.inflight          # CheckRateLimit calls received and not answered yet (gauge)
+ratelimit.service.call.consume_rate_limit.redis_error     # ConsumeRateLimit calls that failed with a Redis error
+ratelimit.service.call.consume_rate_limit.service_error   # ConsumeRateLimit calls that failed with any other error
+ratelimit.service.call.consume_rate_limit.inflight        # ConsumeRateLimit calls received and not answered yet (gauge)
 ```
 
 A rising `inflight` with a flat `redis_error` means calls are waiting on Redis. Redis errors are also logged at warning level, at most once every 10 seconds per process, with the number of suppressed similar messages.
@@ -1285,7 +1299,9 @@ The ratelimit service listens to HTTP 1.1 (by default on port 8080) with two end
 
 1. /healthcheck → return a 200 if this service is healthy
 1. /ready → return a 200 if this service is ready to serve: healthy, and, when the [Redis health probe](#health-checking-for-redis-active-connection) is enabled, able to reach Redis
-1. /json → HTTP 1.1 endpoint for interacting with ratelimit service
+1. /json → HTTP 1.1 endpoint invoking `ShouldRateLimit`
+1. /json/check → HTTP 1.1 endpoint invoking `CheckRateLimit`
+1. /json/consume → HTTP 1.1 endpoint invoking `ConsumeRateLimit`
 
 ## /json endpoint
 

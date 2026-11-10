@@ -117,3 +117,37 @@ func TestJsonHandler(t *testing.T) {
 	}, nil)
 	assertHttpResponse(t, handler, `{"domain": "foo"}`, 429, "application/json", `{"overallCode":"OVER_LIMIT"}`)
 }
+
+func TestCheckAndConsumeJsonHandlers(t *testing.T) {
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+
+	rls := mock_v3.NewMockRateLimitServiceServer(controller)
+	checkHandler := server.NewCheckJsonHandler(rls)
+	consumeHandler := server.NewConsumeJsonHandler(rls)
+	requestMatcher := mock.MatchedBy(func(req *pb.RateLimitRequest) bool {
+		return proto.Equal(req, &pb.RateLimitRequest{
+			Domain: "foo",
+		})
+	})
+
+	rls.EXPECT().CheckRateLimit(context.Background(), requestMatcher).Return(&pb.RateLimitResponse{
+		OverallCode: pb.RateLimitResponse_OK,
+	}, nil)
+	assertHttpResponse(t, checkHandler, `{"domain": "foo"}`, 200, "application/json", `{"overallCode":"OK"}`)
+
+	rls.EXPECT().CheckRateLimit(context.Background(), requestMatcher).Return(&pb.RateLimitResponse{
+		OverallCode: pb.RateLimitResponse_OVER_LIMIT,
+	}, nil)
+	assertHttpResponse(t, checkHandler, `{"domain": "foo"}`, 429, "application/json", `{"overallCode":"OVER_LIMIT"}`)
+
+	rls.EXPECT().ConsumeRateLimit(context.Background(), requestMatcher).Return(&pb.RateLimitResponse{
+		OverallCode: pb.RateLimitResponse_OK,
+	}, nil)
+	assertHttpResponse(t, consumeHandler, `{"domain": "foo"}`, 200, "application/json", `{"overallCode":"OK"}`)
+
+	rls.EXPECT().ConsumeRateLimit(context.Background(), requestMatcher).Return(&pb.RateLimitResponse{
+		OverallCode: pb.RateLimitResponse_OVER_LIMIT,
+	}, nil)
+	assertHttpResponse(t, consumeHandler, `{"domain": "foo"}`, 429, "application/json", `{"overallCode":"OVER_LIMIT"}`)
+}

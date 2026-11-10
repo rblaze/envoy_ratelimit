@@ -242,6 +242,133 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 	return responseDescriptorStatuses
 }
 
+func (this *fixedRateLimitCacheImpl) CheckLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+	limits []*config.RateLimit,
+) []*pb.RateLimitResponse_DescriptorStatus {
+	logger.Debugf("starting cache check lookup")
+
+	hitsAddends := utils.GetHitsAddends(request)
+	cacheKeys := this.baseRateLimiter.GenerateCacheKeysWithoutStats(request, limits)
+
+	isOverLimitWithLocalCache := make([]bool, len(request.Descriptors))
+	currentCount := make([]uint64, len(request.Descriptors))
+	var pipeline, perSecondPipeline Pipeline
+
+	for i, cacheKey := range cacheKeys {
+		if cacheKey.Key == "" {
+			continue
+		}
+
+		if !hitsAddends[i].IsNegative && this.baseRateLimiter.IsOverLimitWithLocalCache(cacheKey.Key) {
+			if limits[i].ShadowMode {
+				logger.Debugf("Cache key %s would be rate limited but shadow mode is enabled on this rule", cacheKey.Key)
+			} else {
+				logger.Debugf("cache key is over the limit: %s", cacheKey.Key)
+			}
+			isOverLimitWithLocalCache[i] = true
+			continue
+		}
+
+		logger.Debugf("checking cache key: %s", cacheKey.Key)
+		client, p := this.selectPipeline(cacheKey, &pipeline, &perSecondPipeline)
+		pipelineAppendtoGet(client, p, cacheKey.Key, &currentCount[i])
+	}
+
+	_, span := tracer.Start(
+		ctx, "Redis Pipeline Execution",
+		trace.WithAttributes(
+			attribute.Int("pipeline length", len(pipeline)),
+			attribute.Int("perSecondPipeline length", len(perSecondPipeline)),
+		),
+	)
+	defer span.End()
+
+	if pipeline != nil {
+		checkError(this.client.PipeDo(ctx, pipeline))
+	}
+	if perSecondPipeline != nil {
+		checkError(this.perSecondClient.PipeDo(ctx, perSecondPipeline))
+	}
+
+	responseDescriptorStatuses := make([]*pb.RateLimitResponse_DescriptorStatus, len(request.Descriptors))
+	for i, cacheKey := range cacheKeys {
+		responseDescriptorStatuses[i] = this.baseRateLimiter.GetCheckResponseDescriptorStatus(
+			cacheKey.Key, limits[i], isOverLimitWithLocalCache[i], currentCount[i], hitsAddends[i])
+	}
+
+	return responseDescriptorStatuses
+}
+
+func (this *fixedRateLimitCacheImpl) ConsumeLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+	limits []*config.RateLimit,
+) []*pb.RateLimitResponse_DescriptorStatus {
+	logger.Debugf("starting cache consume")
+
+	hitsAddends := utils.GetHitsAddends(request)
+	cacheKeys := this.baseRateLimiter.GenerateCacheKeys(request, limits, hitsAddends)
+
+	results := make([]uint64, len(request.Descriptors))
+	var pipeline, perSecondPipeline Pipeline
+
+	for i, cacheKey := range cacheKeys {
+		if cacheKey.Key == "" {
+			continue
+		}
+
+		logger.Debugf("consuming cache key: %s", cacheKey.Key)
+
+		expirationSeconds := this.baseRateLimiter.ExpirationSeconds(limits[i].Limit.Unit)
+		if this.baseRateLimiter.ExpirationJitterMaxSeconds > 0 {
+			expirationSeconds += this.baseRateLimiter.JitterRand.Int63n(this.baseRateLimiter.ExpirationJitterMaxSeconds)
+		}
+
+		client, p := this.selectPipeline(cacheKey, &pipeline, &perSecondPipeline)
+		if hitsAddends[i].IsNegative {
+			pipelineAppendDecrement(client, p, cacheKey.Key, hitsAddends[i].Value, &results[i], expirationSeconds)
+		} else {
+			pipelineAppend(client, p, cacheKey.Key, hitsAddends[i].Value, &results[i], expirationSeconds)
+		}
+	}
+
+	_, span := tracer.Start(
+		ctx, "Redis Pipeline Execution",
+		trace.WithAttributes(
+			attribute.Int("pipeline length", len(pipeline)),
+			attribute.Int("perSecondPipeline length", len(perSecondPipeline)),
+		),
+	)
+	defer span.End()
+
+	if pipeline != nil {
+		checkError(this.client.PipeDo(ctx, pipeline))
+	}
+	if perSecondPipeline != nil {
+		checkError(this.perSecondClient.PipeDo(ctx, perSecondPipeline))
+	}
+
+	responseDescriptorStatuses := make([]*pb.RateLimitResponse_DescriptorStatus, len(request.Descriptors))
+	for i, cacheKey := range cacheKeys {
+		if hitsAddends[i].IsNegative {
+			responseDescriptorStatuses[i] = this.baseRateLimiter.GetResponseDescriptorStatusForNegativeHits(
+				cacheKey.Key, limits[i], results[i])
+		} else {
+			limitAfterIncrease := results[i]
+			limitBeforeIncrease := limitAfterIncrease - hitsAddends[i].Value
+
+			limitInfo := limiter.NewRateLimitInfo(limits[i], limitBeforeIncrease, limitAfterIncrease, 0, 0)
+
+			responseDescriptorStatuses[i] = this.baseRateLimiter.GetResponseDescriptorStatus(cacheKey.Key,
+				limitInfo, false, hitsAddends[i].Value)
+		}
+	}
+
+	return responseDescriptorStatuses
+}
+
 // Flush() is a no-op with redis since quota reads and updates happen synchronously.
 func (this *fixedRateLimitCacheImpl) Flush() {}
 

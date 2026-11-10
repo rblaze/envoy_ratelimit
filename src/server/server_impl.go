@@ -30,6 +30,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/envoyproxy/ratelimit/src/limiter"
+	"github.com/envoyproxy/ratelimit/src/rlspb"
 	"github.com/envoyproxy/ratelimit/src/settings"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -77,11 +78,7 @@ func (server *server) AddDebugHttpEndpoint(path string, help string, handler htt
 	server.debugListener.endpoints[path] = help
 }
 
-// create an http/1 handler at the /json endpoint which allows this ratelimit service to work with
-// clients that cannot use the gRPC interface (e.g. lua)
-// example usage from cURL with domain "dummy" and descriptor "perday":
-// echo '{"domain": "dummy", "descriptors": [{"entries": [{"key": "perday"}]}]}' | curl -vvvXPOST --data @/dev/stdin localhost:8080/json
-func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *http.Request) {
+func newJsonMethodHandler(method func(context.Context, *pb.RateLimitRequest) (*pb.RateLimitResponse, error)) func(http.ResponseWriter, *http.Request) {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		var req pb.RateLimitRequest
 
@@ -100,7 +97,7 @@ func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *ht
 			return
 		}
 
-		resp, err := svc.ShouldRateLimit(ctx, &req)
+		resp, err := method(ctx, &req)
 		if err != nil {
 			logger.Warnf("error: %s", err.Error())
 			writeHttpStatus(writer, http.StatusBadRequest)
@@ -139,6 +136,22 @@ func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *ht
 	}
 }
 
+// create an http/1 handler at the /json endpoint which allows this ratelimit service to work with
+// clients that cannot use the gRPC interface (e.g. lua)
+// example usage from cURL with domain "dummy" and descriptor "perday":
+// echo '{"domain": "dummy", "descriptors": [{"entries": [{"key": "perday"}]}]}' | curl -vvvXPOST --data @/dev/stdin localhost:8080/json
+func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *http.Request) {
+	return newJsonMethodHandler(svc.ShouldRateLimit)
+}
+
+func NewCheckJsonHandler(svc rlspb.RateLimitServiceServer) func(http.ResponseWriter, *http.Request) {
+	return newJsonMethodHandler(svc.CheckRateLimit)
+}
+
+func NewConsumeJsonHandler(svc rlspb.RateLimitServiceServer) func(http.ResponseWriter, *http.Request) {
+	return newJsonMethodHandler(svc.ConsumeRateLimit)
+}
+
 func writeHttpStatus(writer http.ResponseWriter, code int) {
 	http.Error(writer, http.StatusText(code), code)
 }
@@ -155,8 +168,10 @@ func getProviderImpl(s settings.Settings, statsManager stats.Manager, rootStore 
 	}
 }
 
-func (server *server) AddJsonHandler(svc pb.RateLimitServiceServer) {
+func (server *server) AddJsonHandler(svc rlspb.RateLimitServiceServer) {
 	server.router.HandleFunc("/json", NewJsonHandler(svc))
+	server.router.HandleFunc("/json/check", NewCheckJsonHandler(svc))
+	server.router.HandleFunc("/json/consume", NewConsumeJsonHandler(svc))
 }
 
 func (server *server) GrpcServer() *grpc.Server {

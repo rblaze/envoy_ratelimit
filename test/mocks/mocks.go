@@ -7,5 +7,5 @@ package mocks
 //go:generate go run github.com/golang/mock/mockgen -destination ./limiter/limiter.go github.com/envoyproxy/ratelimit/src/limiter RateLimitCache
 //go:generate go run github.com/golang/mock/mockgen -destination ./utils/utils.go github.com/envoyproxy/ratelimit/src/utils TimeSource,JitterRandSource
 //go:generate go run github.com/golang/mock/mockgen -destination ./memcached/client.go github.com/envoyproxy/ratelimit/src/memcached Client
-//go:generate go run github.com/golang/mock/mockgen -destination ./rls/rls.go github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3 RateLimitServiceServer
+//go:generate go run github.com/golang/mock/mockgen -destination ./rls/rls.go github.com/envoyproxy/ratelimit/src/rlspb RateLimitServiceServer
 //go:generate go run github.com/golang/mock/mockgen -destination ./srv/srv.go github.com/envoyproxy/ratelimit/src/srv SrvResolver

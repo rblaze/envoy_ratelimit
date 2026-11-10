@@ -2035,3 +2035,176 @@ func TestServiceMixedModeWithShadowMode(test *testing.T) {
 	// Verify global shadow mode counter is incremented
 	t.assert.EqualValues(1, t.statStore.NewCounter("global_shadow_mode").Value())
 }
+
+func TestCheckAndConsumeRateLimit(test *testing.T) {
+	t := commonSetup(test)
+	defer t.controller.Finish()
+	service := t.setupBasicService()
+
+	request := common.NewRateLimitRequest(
+		"model_router", [][][2]string{{{"model", "gpt-4o"}, {"quota_type", "requests"}}, {{"model", "gpt-4o"}, {"quota_type", "tokens"}}}, 1)
+	limits := []*config.RateLimit{
+		config.NewRateLimit(10, pb.RateLimitResponse_RateLimit_MINUTE, t.statsManager.NewStats("req"), false, false, false, "", nil, false),
+		config.NewRateLimit(500, pb.RateLimitResponse_RateLimit_MINUTE, t.statsManager.NewStats("tok"), false, false, false, "", nil, false),
+	}
+
+	// 1. CheckRateLimit delegates to cache.CheckLimit and returns OVER_LIMIT with non-zero LimitRemaining.
+	t.config.EXPECT().GetLimit(context.Background(), "model_router", request.Descriptors[0]).Return(limits[0])
+	t.config.EXPECT().GetLimit(context.Background(), "model_router", request.Descriptors[1]).Return(limits[1])
+	t.cache.EXPECT().CheckLimit(context.Background(), request, limits).Return(
+		[]*pb.RateLimitResponse_DescriptorStatus{
+			{Code: pb.RateLimitResponse_OK, CurrentLimit: limits[0].Limit, LimitRemaining: 7},
+			{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[1].Limit, LimitRemaining: 100},
+		})
+	response, err := service.CheckRateLimit(context.Background(), request)
+	t.assert.Nil(err)
+	common.AssertProtoEqual(
+		t.assert,
+		&pb.RateLimitResponse{
+			OverallCode: pb.RateLimitResponse_OVER_LIMIT,
+			Statuses: []*pb.RateLimitResponse_DescriptorStatus{
+				{Code: pb.RateLimitResponse_OK, CurrentLimit: limits[0].Limit, LimitRemaining: 7},
+				{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[1].Limit, LimitRemaining: 100},
+			},
+		},
+		response)
+
+	// 2. ConsumeRateLimit delegates to cache.ConsumeLimit and reports post-consumption status.
+	t.config.EXPECT().GetLimit(context.Background(), "model_router", request.Descriptors[0]).Return(limits[0])
+	t.config.EXPECT().GetLimit(context.Background(), "model_router", request.Descriptors[1]).Return(limits[1])
+	t.cache.EXPECT().ConsumeLimit(context.Background(), request, limits).Return(
+		[]*pb.RateLimitResponse_DescriptorStatus{
+			{Code: pb.RateLimitResponse_OK, CurrentLimit: limits[0].Limit, LimitRemaining: 6},
+			{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[1].Limit, LimitRemaining: 0},
+		})
+	response, err = service.ConsumeRateLimit(context.Background(), request)
+	t.assert.Nil(err)
+	common.AssertProtoEqual(
+		t.assert,
+		&pb.RateLimitResponse{
+			OverallCode: pb.RateLimitResponse_OVER_LIMIT,
+			Statuses: []*pb.RateLimitResponse_DescriptorStatus{
+				{Code: pb.RateLimitResponse_OK, CurrentLimit: limits[0].Limit, LimitRemaining: 6},
+				{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[1].Limit, LimitRemaining: 0},
+			},
+		},
+		response)
+
+	// Verify OTel spans carry method-specific span names.
+	spans := testSpanExporter.GetSpans()
+	t.assert.Len(spans, 2)
+	t.assert.Equal("CheckRateLimit Execution", spans[0].Name)
+	t.assert.Equal("ConsumeRateLimit Execution", spans[1].Name)
+}
+
+func TestCheckRateLimitHeadersSelectSmallestOverLimitRemaining(test *testing.T) {
+	os.Setenv("LIMIT_RESPONSE_HEADERS_ENABLED", "true")
+	defer os.Unsetenv("LIMIT_RESPONSE_HEADERS_ENABLED")
+
+	t := commonSetup(test)
+	defer t.controller.Finish()
+	service := t.setupBasicService()
+
+	barrier := newBarrier()
+	t.configUpdateEvent.EXPECT().GetConfig().DoAndReturn(func() (config.RateLimitConfig, any) {
+		barrier.signal()
+		return t.config, nil
+	})
+	t.configUpdateEventChan <- t.configUpdateEvent
+	barrier.wait()
+
+	request := common.NewRateLimitRequest(
+		"domain", [][][2]string{{{"d1", "v"}}, {{"d2", "v"}}}, 1)
+	limits := []*config.RateLimit{
+		config.NewRateLimit(500, pb.RateLimitResponse_RateLimit_MINUTE, t.statsManager.NewStats("d1"), false, false, false, "", nil, false),
+		config.NewRateLimit(1000, pb.RateLimitResponse_RateLimit_MINUTE, t.statsManager.NewStats("d2"), false, false, false, "", nil, false),
+	}
+
+	// Both descriptors are OVER_LIMIT on CheckRateLimit, with remaining 15 vs 100.
+	// Headers must reflect the descriptor with the smaller LimitRemaining (15).
+	t.config.EXPECT().GetLimit(context.Background(), "domain", request.Descriptors[0]).Return(limits[0])
+	t.config.EXPECT().GetLimit(context.Background(), "domain", request.Descriptors[1]).Return(limits[1])
+	t.cache.EXPECT().CheckLimit(context.Background(), request, limits).Return(
+		[]*pb.RateLimitResponse_DescriptorStatus{
+			{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[0].Limit, LimitRemaining: 15},
+			{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[1].Limit, LimitRemaining: 100},
+		})
+
+	response, err := service.CheckRateLimit(context.Background(), request)
+	t.assert.Nil(err)
+	t.assert.Equal(pb.RateLimitResponse_OVER_LIMIT, response.OverallCode)
+	t.assert.Equal([]*core.HeaderValue{
+		{Key: "RateLimit-Limit", Value: "500"},
+		{Key: "RateLimit-Remaining", Value: "15"},
+		{Key: "RateLimit-Reset", Value: "58"},
+	}, response.ResponseHeadersToAdd)
+}
+
+func TestCheckAndConsumeRateLimitGlobalShadowModeAndErrors(test *testing.T) {
+	os.Setenv("SHADOW_MODE", "true")
+	defer os.Unsetenv("SHADOW_MODE")
+
+	t := commonSetup(test)
+	defer t.controller.Finish()
+	service := t.setupBasicService()
+
+	barrier := newBarrier()
+	t.configUpdateEvent.EXPECT().GetConfig().DoAndReturn(func() (config.RateLimitConfig, any) {
+		barrier.signal()
+		return t.config, nil
+	})
+	t.configUpdateEventChan <- t.configUpdateEvent
+	barrier.wait()
+
+	request := common.NewRateLimitRequest("domain", [][][2]string{{{"k", "v"}}}, 1)
+	limits := []*config.RateLimit{
+		config.NewRateLimit(10, pb.RateLimitResponse_RateLimit_MINUTE, t.statsManager.NewStats("k"), false, false, false, "", nil, false),
+	}
+
+	// CheckRateLimit honors GlobalShadowMode (returns OK) WITHOUT incrementing global_shadow_mode stat.
+	t.config.EXPECT().GetLimit(context.Background(), "domain", request.Descriptors[0]).Return(limits[0])
+	t.cache.EXPECT().CheckLimit(context.Background(), request, limits).Return(
+		[]*pb.RateLimitResponse_DescriptorStatus{
+			{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[0].Limit, LimitRemaining: 0},
+		})
+	resp, err := service.CheckRateLimit(context.Background(), request)
+	t.assert.Nil(err)
+	t.assert.Equal(pb.RateLimitResponse_OK, resp.OverallCode)
+	t.assert.EqualValues(0, t.statStore.NewCounter("global_shadow_mode").Value())
+
+	// ConsumeRateLimit honors GlobalShadowMode AND increments global_shadow_mode stat.
+	t.config.EXPECT().GetLimit(context.Background(), "domain", request.Descriptors[0]).Return(limits[0])
+	t.cache.EXPECT().ConsumeLimit(context.Background(), request, limits).Return(
+		[]*pb.RateLimitResponse_DescriptorStatus{
+			{Code: pb.RateLimitResponse_OVER_LIMIT, CurrentLimit: limits[0].Limit, LimitRemaining: 0},
+		})
+	resp, err = service.ConsumeRateLimit(context.Background(), request)
+	t.assert.Nil(err)
+	t.assert.Equal(pb.RateLimitResponse_OK, resp.OverallCode)
+	t.assert.EqualValues(1, t.statStore.NewCounter("global_shadow_mode").Value())
+
+	// ServiceError and RedisError are tracked under dedicated call scopes.
+	_, err = service.CheckRateLimit(context.Background(), common.NewRateLimitRequest("", [][][2]string{{{"k", "v"}}}, 1))
+	t.assert.Error(err)
+	t.assert.EqualValues(1, t.statStore.Scope("call.check_rate_limit").NewCounter("service_error").Value())
+
+	_, err = service.ConsumeRateLimit(context.Background(), common.NewRateLimitRequest("", [][][2]string{{{"k", "v"}}}, 1))
+	t.assert.Error(err)
+	t.assert.EqualValues(1, t.statStore.Scope("call.consume_rate_limit").NewCounter("service_error").Value())
+
+	t.config.EXPECT().GetLimit(context.Background(), "domain", request.Descriptors[0]).Return(limits[0])
+	t.cache.EXPECT().CheckLimit(context.Background(), request, limits).Do(func(context.Context, *pb.RateLimitRequest, []*config.RateLimit) {
+		panic(redis.RedisError("check redis down"))
+	})
+	_, err = service.CheckRateLimit(context.Background(), request)
+	t.assert.EqualError(err, "check redis down")
+	t.assert.EqualValues(1, t.statStore.Scope("call.check_rate_limit").NewCounter("redis_error").Value())
+
+	t.config.EXPECT().GetLimit(context.Background(), "domain", request.Descriptors[0]).Return(limits[0])
+	t.cache.EXPECT().ConsumeLimit(context.Background(), request, limits).Do(func(context.Context, *pb.RateLimitRequest, []*config.RateLimit) {
+		panic(redis.RedisError("consume redis down"))
+	})
+	_, err = service.ConsumeRateLimit(context.Background(), request)
+	t.assert.EqualError(err, "consume redis down")
+	t.assert.EqualValues(1, t.statStore.Scope("call.consume_rate_limit").NewCounter("redis_error").Value())
+}

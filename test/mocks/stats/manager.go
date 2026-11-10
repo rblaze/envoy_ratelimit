@@ -21,8 +21,8 @@ func (m *MockStatManager) SanitizeDescriptorMetricDots() bool {
 	return m.sanitizeDescriptorMetricDots
 }
 
-func (m *MockStatManager) NewShouldRateLimitStats() stats.ShouldRateLimitStats {
-	s := m.store.Scope("call.should_rate_limit")
+func (m *MockStatManager) newCallStats(scopeName string) stats.ShouldRateLimitStats {
+	s := m.store.Scope(scopeName)
 	ret := stats.ShouldRateLimitStats{}
 	ret.RedisError = s.NewCounter("redis_error")
 	ret.ServiceError = s.NewCounter("service_error")
@@ -30,11 +30,25 @@ func (m *MockStatManager) NewShouldRateLimitStats() stats.ShouldRateLimitStats {
 	return ret
 }
 
+func (m *MockStatManager) NewShouldRateLimitStats() stats.ShouldRateLimitStats {
+	return m.newCallStats("call.should_rate_limit")
+}
+
+func (m *MockStatManager) NewCheckRateLimitStats() stats.ShouldRateLimitStats {
+	return m.newCallStats("call.check_rate_limit")
+}
+
+func (m *MockStatManager) NewConsumeRateLimitStats() stats.ShouldRateLimitStats {
+	return m.newCallStats("call.consume_rate_limit")
+}
+
 func (m *MockStatManager) NewServiceStats() stats.ServiceStats {
 	ret := stats.ServiceStats{}
 	ret.ConfigLoadSuccess = m.store.NewCounter("config_load_success")
 	ret.ConfigLoadError = m.store.NewCounter("config_load_error")
 	ret.ShouldRateLimit = m.NewShouldRateLimitStats()
+	ret.CheckRateLimit = m.NewCheckRateLimitStats()
+	ret.ConsumeRateLimit = m.NewConsumeRateLimitStats()
 	ret.GlobalShadowMode = m.store.NewCounter("global_shadow_mode")
 	return ret
 }

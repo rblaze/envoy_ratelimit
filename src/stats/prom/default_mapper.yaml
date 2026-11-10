@@ -77,6 +77,16 @@ mappings:
     match_metric_type: counter
     labels:
       err_type: "$1"
+  - match: "ratelimit.service.call.check_rate_limit.*"
+    name: "ratelimit_service_check_rate_limit_error"
+    match_metric_type: counter
+    labels:
+      err_type: "$1"
+  - match: "ratelimit.service.call.consume_rate_limit.*"
+    name: "ratelimit_service_consume_rate_limit_error"
+    match_metric_type: counter
+    labels:
+      err_type: "$1"
 
   - match: "ratelimit_server.*.total_requests"
     name: "ratelimit_service_total_requests"

@@ -15,6 +15,8 @@ func NewStatManager(store gostats.Store, settings settings.Settings) *ManagerImp
 		rlStatsScope:                 serviceScope.Scope("rate_limit"),
 		serviceStatsScope:            serviceScope,
 		shouldRateLimitScope:         serviceScope.Scope("call.should_rate_limit"),
+		checkRateLimitScope:          serviceScope.Scope("call.check_rate_limit"),
+		consumeRateLimitScope:        serviceScope.Scope("call.consume_rate_limit"),
 		sanitizeDescriptorMetricDots: settings.SanitizeDescriptorMetricDots,
 	}
 }
@@ -52,12 +54,24 @@ func (this *ManagerImpl) NewDomainStats(domain string) DomainStats {
 	return ret
 }
 
-func (this *ManagerImpl) NewShouldRateLimitStats() ShouldRateLimitStats {
+func newCallStats(scope gostats.Scope) ShouldRateLimitStats {
 	ret := ShouldRateLimitStats{}
-	ret.RedisError = this.shouldRateLimitScope.NewCounter("redis_error")
-	ret.ServiceError = this.shouldRateLimitScope.NewCounter("service_error")
-	ret.Inflight = this.shouldRateLimitScope.NewGauge("inflight")
+	ret.RedisError = scope.NewCounter("redis_error")
+	ret.ServiceError = scope.NewCounter("service_error")
+	ret.Inflight = scope.NewGauge("inflight")
 	return ret
+}
+
+func (this *ManagerImpl) NewShouldRateLimitStats() ShouldRateLimitStats {
+	return newCallStats(this.shouldRateLimitScope)
+}
+
+func (this *ManagerImpl) NewCheckRateLimitStats() ShouldRateLimitStats {
+	return newCallStats(this.checkRateLimitScope)
+}
+
+func (this *ManagerImpl) NewConsumeRateLimitStats() ShouldRateLimitStats {
+	return newCallStats(this.consumeRateLimitScope)
 }
 
 func (this *ManagerImpl) NewServiceStats() ServiceStats {
@@ -65,6 +79,8 @@ func (this *ManagerImpl) NewServiceStats() ServiceStats {
 	ret.ConfigLoadSuccess = this.serviceStatsScope.NewCounter("config_load_success")
 	ret.ConfigLoadError = this.serviceStatsScope.NewCounter("config_load_error")
 	ret.ShouldRateLimit = this.NewShouldRateLimitStats()
+	ret.CheckRateLimit = this.NewCheckRateLimitStats()
+	ret.ConsumeRateLimit = this.NewConsumeRateLimitStats()
 	ret.GlobalShadowMode = this.serviceStatsScope.NewCounter("global_shadow_mode")
 	return ret
 }

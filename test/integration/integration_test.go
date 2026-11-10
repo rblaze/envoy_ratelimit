@@ -23,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/envoyproxy/ratelimit/src/memcached"
+	"github.com/envoyproxy/ratelimit/src/rlspb"
 	"github.com/envoyproxy/ratelimit/src/service_cmd/runner"
 	"github.com/envoyproxy/ratelimit/src/settings"
 	"github.com/envoyproxy/ratelimit/src/utils"
@@ -94,6 +95,64 @@ func TestNegativeHitsIntegration(t *testing.T) {
 		{Port: 6383},
 	}, func() {
 		t.Run("Redis", testNegativeHits(makeSimpleRedisSettings(6383, 6380, false, 0)))
+	})
+}
+
+func TestCheckAndConsumeRateLimitIntegration(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+	}, func() {
+		t.Run("Redis", func(t *testing.T) {
+			s := makeSimpleRedisSettingsWithStopCacheKeyIncrementWhenOverlimit(6383, 6380, false, 1000)
+			runner := startTestRunner(t, s)
+			defer runner.Stop()
+
+			assert := assert.New(t)
+			conn, err := grpc.Dial(fmt.Sprintf("localhost:%v", s.GrpcPort), grpc.WithInsecure())
+			assert.NoError(err)
+			defer conn.Close()
+			c := rlspb.NewRateLimitServiceClient(conn)
+
+			// CheckRateLimit against key2 (limit 20/minute) with hitsAddend=15 -> OK, LimitRemaining=20 (unconsumed).
+			resp, err := c.CheckRateLimit(
+				context.Background(),
+				common.NewRateLimitRequest("another", [][][2]string{{{"key2", "check_consume_test"}}}, 15))
+			assert.NoError(err)
+			assert.Equal(pb.RateLimitResponse_OK, resp.OverallCode)
+			assert.Equal(uint32(20), resp.Statuses[0].LimitRemaining)
+
+			// ConsumeRateLimit 15 hits -> OK, LimitRemaining=5.
+			resp, err = c.ConsumeRateLimit(
+				context.Background(),
+				common.NewRateLimitRequest("another", [][][2]string{{{"key2", "check_consume_test"}}}, 15))
+			assert.NoError(err)
+			assert.Equal(pb.RateLimitResponse_OK, resp.OverallCode)
+			assert.Equal(uint32(5), resp.Statuses[0].LimitRemaining)
+
+			// CheckRateLimit 10 hits -> OVER_LIMIT, LimitRemaining=5 (actual remaining), without poisoning localCache.
+			resp, err = c.CheckRateLimit(
+				context.Background(),
+				common.NewRateLimitRequest("another", [][][2]string{{{"key2", "check_consume_test"}}}, 10))
+			assert.NoError(err)
+			assert.Equal(pb.RateLimitResponse_OVER_LIMIT, resp.OverallCode)
+			assert.Equal(uint32(5), resp.Statuses[0].LimitRemaining)
+
+			// CheckRateLimit 5 hits -> still OK, LimitRemaining=5.
+			resp, err = c.CheckRateLimit(
+				context.Background(),
+				common.NewRateLimitRequest("another", [][][2]string{{{"key2", "check_consume_test"}}}, 5))
+			assert.NoError(err)
+			assert.Equal(pb.RateLimitResponse_OK, resp.OverallCode)
+			assert.Equal(uint32(5), resp.Statuses[0].LimitRemaining)
+
+			// ConsumeRateLimit 10 hits -> OVER_LIMIT, LimitRemaining=0.
+			resp, err = c.ConsumeRateLimit(
+				context.Background(),
+				common.NewRateLimitRequest("another", [][][2]string{{{"key2", "check_consume_test"}}}, 10))
+			assert.NoError(err)
+			assert.Equal(pb.RateLimitResponse_OVER_LIMIT, resp.OverallCode)
+			assert.Equal(uint32(0), resp.Statuses[0].LimitRemaining)
+		})
 	})
 }
 

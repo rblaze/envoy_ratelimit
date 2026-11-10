@@ -167,6 +167,139 @@ func (this *rateLimitMemcacheImpl) DoLimit(
 	return responseDescriptorStatuses
 }
 
+func decodeMemcacheCount(memcacheValues map[string]*memcache.Item, key string) uint64 {
+	rawMemcacheValue, ok := memcacheValues[key]
+	if !ok {
+		return 0
+	}
+	decoded, err := strconv.ParseUint(string(rawMemcacheValue.Value), 10, 64)
+	if err != nil {
+		logger.Errorf("Unexpected non-numeric value in memcached: %v", rawMemcacheValue)
+		return 0
+	}
+	return decoded
+}
+
+func (this *rateLimitMemcacheImpl) CheckLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+	limits []*config.RateLimit,
+) []*pb.RateLimitResponse_DescriptorStatus {
+	logger.Debugf("starting cache check lookup")
+
+	hitsAddends := utils.GetHitsAddends(request)
+	cacheKeys := this.baseRateLimiter.GenerateCacheKeysWithoutStats(request, limits)
+
+	isOverLimitWithLocalCache := make([]bool, len(request.Descriptors))
+	keysToGet := make([]string, 0, len(request.Descriptors))
+
+	for i, cacheKey := range cacheKeys {
+		if cacheKey.Key == "" {
+			continue
+		}
+
+		if !hitsAddends[i].IsNegative && this.baseRateLimiter.IsOverLimitWithLocalCache(cacheKey.Key) {
+			isOverLimitWithLocalCache[i] = true
+			logger.Debugf("cache key is over the limit: %s", cacheKey.Key)
+			continue
+		}
+
+		logger.Debugf("checking cache key: %s", cacheKey.Key)
+		keysToGet = append(keysToGet, cacheKey.Key)
+	}
+
+	_, span := tracer.Start(
+		ctx, "Memcached Fetch Execution",
+		trace.WithAttributes(
+			attribute.Int("keysToGet length", len(keysToGet)),
+		),
+	)
+	defer span.End()
+
+	var memcacheValues map[string]*memcache.Item
+	var err error
+	if len(keysToGet) > 0 {
+		memcacheValues, err = this.client.GetMulti(keysToGet)
+		if err != nil {
+			logger.Errorf("Error multi-getting memcache keys (%s): %s", keysToGet, err)
+		}
+	}
+
+	responseDescriptorStatuses := make([]*pb.RateLimitResponse_DescriptorStatus, len(request.Descriptors))
+	for i, cacheKey := range cacheKeys {
+		currentCount := decodeMemcacheCount(memcacheValues, cacheKey.Key)
+		responseDescriptorStatuses[i] = this.baseRateLimiter.GetCheckResponseDescriptorStatus(
+			cacheKey.Key, limits[i], isOverLimitWithLocalCache[i], currentCount, hitsAddends[i])
+	}
+
+	return responseDescriptorStatuses
+}
+
+func (this *rateLimitMemcacheImpl) ConsumeLimit(
+	ctx context.Context,
+	request *pb.RateLimitRequest,
+	limits []*config.RateLimit,
+) []*pb.RateLimitResponse_DescriptorStatus {
+	logger.Debugf("starting cache consume")
+
+	hitsAddends := utils.GetHitsAddends(request)
+	cacheKeys := this.baseRateLimiter.GenerateCacheKeys(request, limits, hitsAddends)
+
+	keysToGet := make([]string, 0, len(request.Descriptors))
+	for _, cacheKey := range cacheKeys {
+		if cacheKey.Key == "" {
+			continue
+		}
+		logger.Debugf("consuming cache key: %s", cacheKey.Key)
+		keysToGet = append(keysToGet, cacheKey.Key)
+	}
+
+	_, span := tracer.Start(
+		ctx, "Memcached Fetch Execution",
+		trace.WithAttributes(
+			attribute.Int("keysToGet length", len(keysToGet)),
+		),
+	)
+	defer span.End()
+
+	var memcacheValues map[string]*memcache.Item
+	var err error
+	if len(keysToGet) > 0 {
+		memcacheValues, err = this.client.GetMulti(keysToGet)
+		if err != nil {
+			logger.Errorf("Error multi-getting memcache keys (%s): %s", keysToGet, err)
+		}
+	}
+
+	responseDescriptorStatuses := make([]*pb.RateLimitResponse_DescriptorStatus, len(request.Descriptors))
+	for i, cacheKey := range cacheKeys {
+		limitBeforeIncrease := decodeMemcacheCount(memcacheValues, cacheKey.Key)
+
+		if hitsAddends[i].IsNegative {
+			var limitAfterDecrease uint64
+			if limitBeforeIncrease > hitsAddends[i].Value {
+				limitAfterDecrease = limitBeforeIncrease - hitsAddends[i].Value
+			}
+			responseDescriptorStatuses[i] = this.baseRateLimiter.GetResponseDescriptorStatusForNegativeHits(
+				cacheKey.Key, limits[i], limitAfterDecrease)
+		} else {
+			limitAfterIncrease := limitBeforeIncrease + hitsAddends[i].Value
+			limitInfo := limiter.NewRateLimitInfo(limits[i], limitBeforeIncrease, limitAfterIncrease, 0, 0)
+			responseDescriptorStatuses[i] = this.baseRateLimiter.GetResponseDescriptorStatus(cacheKey.Key,
+				limitInfo, false, hitsAddends[i].Value)
+		}
+	}
+
+	noLocalCacheSkip := make([]bool, len(request.Descriptors))
+	this.waitGroup.Add(1)
+	runAsync(func() { this.increaseAsync(cacheKeys, noLocalCacheSkip, limits, hitsAddends) })
+	if AutoFlushForIntegrationTests {
+		this.Flush()
+	}
+
+	return responseDescriptorStatuses
+}
+
 // memcachedMaxRelativeExpirationSeconds is the largest expiration value memcached treats as a
 // relative offset in seconds. Per the memcached protocol, any expiration greater than 30 days
 // is instead interpreted as an absolute Unix timestamp.

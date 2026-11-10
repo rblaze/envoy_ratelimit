@@ -60,10 +60,9 @@ func NewRateLimitInfo(limit *config.RateLimit, limitBeforeIncrease uint64, limit
 	}
 }
 
-// Generates cache keys for given rate limit request. Each cache key is represented by a concatenation of
-// domain, descriptor and current timestamp.
-func (this *BaseRateLimiter) GenerateCacheKeys(request *pb.RateLimitRequest,
-	limits []*config.RateLimit, hitsAddends []utils.HitsAddend,
+// Generates cache keys for given rate limit request without mutating per-rule statistics.
+func (this *BaseRateLimiter) GenerateCacheKeysWithoutStats(request *pb.RateLimitRequest,
+	limits []*config.RateLimit,
 ) []CacheKey {
 	assert.Assert(len(request.Descriptors) == len(limits))
 	cacheKeys := make([]CacheKey, len(request.Descriptors))
@@ -72,6 +71,17 @@ func (this *BaseRateLimiter) GenerateCacheKeys(request *pb.RateLimitRequest,
 		// generateCacheKey() returns an empty string in the key if there is no limit
 		// so that we can keep the arrays all the same size.
 		cacheKeys[i] = this.cacheKeyGenerator.GenerateCacheKey(request.Domain, request.Descriptors[i], limits[i], now)
+	}
+	return cacheKeys
+}
+
+// Generates cache keys for given rate limit request. Each cache key is represented by a concatenation of
+// domain, descriptor and current timestamp.
+func (this *BaseRateLimiter) GenerateCacheKeys(request *pb.RateLimitRequest,
+	limits []*config.RateLimit, hitsAddends []utils.HitsAddend,
+) []CacheKey {
+	cacheKeys := this.GenerateCacheKeysWithoutStats(request, limits)
+	for i := 0; i < len(request.Descriptors); i++ {
 		// Increase statistics for limits hit by their respective requests.
 		if limits[i] != nil {
 			if hitsAddends[i].IsNegative {
@@ -191,6 +201,52 @@ func (this *BaseRateLimiter) GetResponseDescriptorStatusForNegativeHits(key stri
 	}
 
 	return this.generateResponseDescriptorStatus(pb.RateLimitResponse_OK, limit.Limit, uint32(limitRemaining))
+}
+
+// GetCheckResponseDescriptorStatus generates a read-only check response for CheckRateLimit.
+// It neither mutates per-rule RateLimitStats nor writes to localCache, and always reports the
+// actual remaining quota before consumption: max(0, limit - currentCount).
+func (this *BaseRateLimiter) GetCheckResponseDescriptorStatus(key string, limit *config.RateLimit,
+	isOverLimitWithLocalCache bool, currentCount uint64, hitsAddend utils.HitsAddend,
+) *pb.RateLimitResponse_DescriptorStatus {
+	if key == "" {
+		return this.generateResponseDescriptorStatus(pb.RateLimitResponse_OK, nil, 0)
+	}
+
+	overLimitThreshold := uint64(limit.Limit.RequestsPerUnit)
+	if hitsAddend.IsNegative {
+		var limitRemaining uint64
+		if overLimitThreshold > currentCount {
+			limitRemaining = overLimitThreshold - currentCount
+		}
+		return this.generateResponseDescriptorStatus(pb.RateLimitResponse_OK, limit.Limit, uint32(limitRemaining))
+	}
+
+	if isOverLimitWithLocalCache {
+		code := pb.RateLimitResponse_OVER_LIMIT
+		if limit.ShadowMode {
+			logger.Debugf("Limit with key %s, is in shadow_mode", limit.FullKey)
+			code = pb.RateLimitResponse_OK
+		}
+		return this.generateResponseDescriptorStatus(code, limit.Limit, 0)
+	}
+
+	var limitRemaining uint64
+	if overLimitThreshold > currentCount {
+		limitRemaining = overLimitThreshold - currentCount
+	}
+
+	isOverLimit := currentCount > overLimitThreshold || hitsAddend.Value > limitRemaining
+	code := pb.RateLimitResponse_OK
+	if isOverLimit {
+		if limit.ShadowMode {
+			logger.Debugf("Limit with key %s, is in shadow_mode", limit.FullKey)
+		} else {
+			code = pb.RateLimitResponse_OVER_LIMIT
+		}
+	}
+
+	return this.generateResponseDescriptorStatus(code, limit.Limit, uint32(limitRemaining))
 }
 
 func NewBaseRateLimit(timeSource utils.TimeSource, jitterRand *rand.Rand, expirationJitterMaxSeconds int64,
